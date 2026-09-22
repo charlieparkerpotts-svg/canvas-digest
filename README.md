@@ -1,8 +1,9 @@
 # Canvas Digest
 
 Emails you what's due **today** and **tomorrow** across all your active Canvas
-courses, every morning, automatically. Uses Canvas's official REST API (not
-HTML scraping), so it keeps working even if Canvas changes its page layout.
+courses, every morning, automatically — plus a heads-up on bigger assignments
+several days before they're due. Uses Canvas's official REST API (not HTML
+scraping), so it keeps working even if Canvas changes its page layout.
 
 No Claude/AI subscription needed to run this — it's a plain Python script.
 
@@ -10,7 +11,14 @@ No Claude/AI subscription needed to run this — it's a plain Python script.
 
 - Pulls your active courses and their assignments from the Canvas API
 - Filters to anything due today or tomorrow (in your timezone)
-- Emails you a short digest, grouped by day
+- Estimates how long each assignment will take (from its points value plus
+  keyword hints like "project" or "quiz" in the title/description), and if
+  that estimate is big enough, surfaces it in a **"heads up"** section days
+  before it's actually due — so a paper doesn't blindside you the night
+  before. This is a rough heuristic, not a real time estimate; tune the
+  constants near the top of `canvas_digest.py` (`POINTS_PER_HOUR`,
+  `HEAVY_KEYWORDS`, `LEAD_TIME_BREAKPOINTS`, etc.) if it's off for your courses.
+- Emails you a short digest, grouped into Due Today / Due Tomorrow / Heads Up
 - Optional: `--sync-syllabi` saves each course's syllabus HTML locally for
   reference (syllabus text is freeform, so it's not parsed for dates — the
   Assignments API is the reliable source for those)

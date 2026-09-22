@@ -2,8 +2,9 @@
 """
 Canvas Digest — emails you what's due today and tomorrow across all your
 active Canvas courses, pulled from Canvas's official REST API (not scraped
-HTML). Optionally dumps each course's syllabus to a local folder for
-reference with --sync-syllabi.
+HTML). Bigger assignments (estimated by points + keyword heuristics) also
+get surfaced several days early in a "heads up" section. Optionally dumps
+each course's syllabus to a local folder for reference with --sync-syllabi.
 
 Setup: copy .env.example to .env and fill in your values, or set the same
 names as real environment variables / GitHub Actions secrets.
@@ -19,20 +20,69 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-REQUIRED_ENV = ["CANVAS_BASE_URL", "CANVAS_API_TOKEN", "EMAIL_FROM", "GMAIL_APP_PASSWORD"]
+REQUIRED_ENV = ["CANVAS_BASE_URL", "CANVAS_API_TOKEN"]
+REQUIRED_ENV_FOR_EMAIL = ["EMAIL_FROM", "GMAIL_APP_PASSWORD"]
+
+# --- Effort estimate heuristic ---------------------------------------------
+# Canvas has no "how long will this take" field, so this is a rough guess
+# built from points_possible plus keyword hints in the title/description.
+# It's meant to flag things worth starting early, not to be precise. Tune
+# these constants directly if the estimates feel off for your courses.
+POINTS_PER_HOUR = 10  # e.g. a 50-point assignment ≈ 5 hours baseline
+MIN_HOURS = 0.25
+HEAVY_KEYWORDS = [
+    "project", "paper", "essay", "presentation", "research", "portfolio",
+    "case study", "report", "final exam", "midterm", "capstone", "proposal",
+]
+HEAVY_MULTIPLIER = 1.5
+HEAVY_MIN_HOURS = 3  # a "project"/"paper" is assumed at least this long even at 0 points
+LIGHT_KEYWORDS = ["quiz", "discussion", "reading response", "worksheet", "reflection"]
+LIGHT_CAP_HOURS = 1.5  # quizzes/discussions rarely take longer than this
+
+# Maps estimated hours -> how many days before the due date to start
+# surfacing the assignment in a "heads up" section (beyond the normal
+# today/tomorrow window).
+LEAD_TIME_BREAKPOINTS = [
+    (2, 0),           # < 2h: no extra advance notice
+    (4, 2),           # 2-4h: mention starting 2 days out
+    (8, 4),           # 4-8h: mention starting 4 days out
+    (float("inf"), 7),  # 8h+: mention starting a week out
+]
 
 
-def load_config():
-    missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
+def estimate_hours(assignment):
+    points = assignment.get("points_possible") or 0
+    text = f"{assignment.get('name') or ''} {assignment.get('description') or ''}".lower()
+
+    hours = points / POINTS_PER_HOUR
+    if any(k in text for k in HEAVY_KEYWORDS):
+        hours = max(hours, HEAVY_MIN_HOURS) * HEAVY_MULTIPLIER
+    if any(k in text for k in LIGHT_KEYWORDS):
+        hours = min(hours, LIGHT_CAP_HOURS)
+
+    return round(max(hours, MIN_HOURS), 1)
+
+
+def lead_days_for(hours):
+    for threshold, days in LEAD_TIME_BREAKPOINTS:
+        if hours < threshold:
+            return days
+    return LEAD_TIME_BREAKPOINTS[-1][1]
+
+
+def load_config(require_email=True):
+    required = REQUIRED_ENV + (REQUIRED_ENV_FOR_EMAIL if require_email else [])
+    missing = [name for name in required if not os.environ.get(name)]
     if missing:
         sys.exit(f"Missing required environment variables: {', '.join(missing)}")
 
+    email_from = os.environ.get("EMAIL_FROM", "")
     return {
         "base_url": os.environ["CANVAS_BASE_URL"].rstrip("/"),
         "token": os.environ["CANVAS_API_TOKEN"],
-        "email_from": os.environ["EMAIL_FROM"],
-        "email_to": os.environ.get("EMAIL_TO", os.environ["EMAIL_FROM"]),
-        "gmail_app_password": os.environ["GMAIL_APP_PASSWORD"],
+        "email_from": email_from,
+        "email_to": os.environ.get("EMAIL_TO", email_from),
+        "gmail_app_password": os.environ.get("GMAIL_APP_PASSWORD", ""),
         "tz": ZoneInfo(os.environ.get("TIMEZONE", "America/New_York")),
         "send_if_empty": os.environ.get("SEND_IF_EMPTY", "true").lower() != "false",
     }
@@ -76,15 +126,17 @@ def parse_due_at(due_at_str):
     return datetime.fromisoformat(due_at_str.replace("Z", "+00:00"))
 
 
-def collect_due_assignments(session, config):
-    """Return (today_items, tomorrow_items), each a list of
-    (course_name, assignment_title, local_due_dt, html_url)."""
-    tz = config["tz"]
-    now_local = datetime.now(tz)
-    today = now_local.date()
-    tomorrow = today + timedelta(days=1)
+def collect_digest_items(session, config):
+    """Return (today_items, tomorrow_items, upcoming_items).
 
-    today_items, tomorrow_items = [], []
+    today_items / tomorrow_items: (course_name, assignment_name, due_local, url, hours)
+    upcoming_items: same plus days_until — bigger assignments (by estimated
+    hours) that fall inside their own lead-time window but aren't due
+    today/tomorrow yet."""
+    tz = config["tz"]
+    today = datetime.now(tz).date()
+
+    today_items, tomorrow_items, upcoming_items = [], [], []
 
     courses = get_active_courses(session, config["base_url"])
     for course in courses:
@@ -94,33 +146,60 @@ def collect_due_assignments(session, config):
             if not due_at:
                 continue
             due_local = parse_due_at(due_at).astimezone(tz)
-            item = (course["name"], a["name"], due_local, a.get("html_url", ""))
-            if due_local.date() == today:
-                today_items.append(item)
-            elif due_local.date() == tomorrow:
-                tomorrow_items.append(item)
+            days_until = (due_local.date() - today).days
+            if days_until < 0:
+                continue
+
+            hours = estimate_hours(a)
+            url = a.get("html_url", "")
+
+            if days_until == 0:
+                today_items.append((course["name"], a["name"], due_local, url, hours))
+            elif days_until == 1:
+                tomorrow_items.append((course["name"], a["name"], due_local, url, hours))
+            elif days_until <= lead_days_for(hours):
+                upcoming_items.append((course["name"], a["name"], due_local, url, hours, days_until))
 
     today_items.sort(key=lambda x: x[2])
     tomorrow_items.sort(key=lambda x: x[2])
-    return today_items, tomorrow_items
+    upcoming_items.sort(key=lambda x: x[2])
+    return today_items, tomorrow_items, upcoming_items
 
 
 def format_section(title, items):
     if not items:
         return f"{title}\n  Nothing due.\n"
     lines = [title]
-    for course_name, assignment_name, due_local, url in items:
-        lines.append(f"  [{due_local.strftime('%I:%M %p').lstrip('0')}] {course_name} — {assignment_name}")
+    for course_name, assignment_name, due_local, url, hours in items:
+        time_str = due_local.strftime("%I:%M %p").lstrip("0")
+        lines.append(f"  [{time_str}] {course_name} — {assignment_name} (~{hours}h)")
         if url:
             lines.append(f"      {url}")
     return "\n".join(lines) + "\n"
 
 
-def build_email_body(today_items, tomorrow_items):
+def format_upcoming_section(items):
+    if not items:
+        return ""
+    lines = ["HEADS UP — BIGGER THINGS COMING"]
+    for course_name, assignment_name, due_local, url, hours, days_until in items:
+        day_str = due_local.strftime("%a %b %d")
+        lines.append(
+            f"  Due in {days_until} days ({day_str}): {course_name} — {assignment_name} (~{hours}h)"
+        )
+        if url:
+            lines.append(f"      {url}")
+    return "\n".join(lines) + "\n"
+
+
+def build_email_body(today_items, tomorrow_items, upcoming_items):
     parts = [
         format_section("DUE TODAY", today_items),
         format_section("DUE TOMORROW", tomorrow_items),
     ]
+    upcoming_section = format_upcoming_section(upcoming_items)
+    if upcoming_section:
+        parts.append(upcoming_section)
     return "\n".join(parts)
 
 
@@ -170,15 +249,15 @@ def main():
     )
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(require_email=not args.dry_run)
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {config['token']}"})
 
     if args.sync_syllabi:
         sync_syllabi(session, config)
 
-    today_items, tomorrow_items = collect_due_assignments(session, config)
-    body = build_email_body(today_items, tomorrow_items)
+    today_items, tomorrow_items, upcoming_items = collect_digest_items(session, config)
+    body = build_email_body(today_items, tomorrow_items, upcoming_items)
     subject = f"Canvas Digest — {datetime.now(config['tz']).strftime('%A, %B %d')}"
 
     if args.dry_run:
@@ -186,7 +265,7 @@ def main():
         print(body)
         return
 
-    if not today_items and not tomorrow_items and not config["send_if_empty"]:
+    if not today_items and not tomorrow_items and not upcoming_items and not config["send_if_empty"]:
         print("Nothing due today or tomorrow; SEND_IF_EMPTY=false, skipping email.")
         return
 
