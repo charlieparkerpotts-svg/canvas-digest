@@ -1,0 +1,6 @@
+.env
+syllabi/
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,31 @@
+name: Canvas Daily Digest
+
+on:
+  schedule:
+    # 12:00 UTC ≈ 7-8am US Eastern depending on DST. Cron times are always
+    # UTC and don't shift with daylight saving, so adjust this to fit your
+    # own timezone/wake-up time.
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Send digest
+        env:
+          CANVAS_BASE_URL: ${{ secrets.CANVAS_BASE_URL }}
+          CANVAS_API_TOKEN: ${{ secrets.CANVAS_API_TOKEN }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TIMEZONE: ${{ secrets.TIMEZONE }}
+        run: python canvas_digest.py
