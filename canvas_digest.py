@@ -49,6 +49,10 @@ LEAD_TIME_BREAKPOINTS = [
     (float("inf"), 7),  # 8h+: mention starting a week out
 ]
 
+# "DUE NEXT WEEK" section covers everything due from the day after tomorrow
+# through this many days out.
+NEXT_WEEK_WINDOW_DAYS = 8
+
 
 def estimate_hours(assignment):
     points = assignment.get("points_possible") or 0
@@ -127,16 +131,18 @@ def parse_due_at(due_at_str):
 
 
 def collect_digest_items(session, config):
-    """Return (today_items, tomorrow_items, upcoming_items).
+    """Return (today_items, tomorrow_items, next_week_items, upcoming_items).
 
     today_items / tomorrow_items: (course_name, assignment_name, due_local, url, hours)
-    upcoming_items: same plus days_until — bigger assignments (by estimated
-    hours) that fall inside their own lead-time window but aren't due
-    today/tomorrow yet."""
+    next_week_items: same plus days_until — everything due from the day after
+    tomorrow through NEXT_WEEK_WINDOW_DAYS out, ranked by importance.
+    upcoming_items: same shape as next_week_items — bigger assignments (by
+    estimated hours) that fall inside their own lead-time window but aren't
+    due today/tomorrow yet."""
     tz = config["tz"]
     today = datetime.now(tz).date()
 
-    today_items, tomorrow_items, upcoming_items = [], [], []
+    today_items, tomorrow_items, next_week_items, upcoming_items = [], [], [], []
 
     courses = get_active_courses(session, config["base_url"])
     for course in courses:
@@ -160,10 +166,14 @@ def collect_digest_items(session, config):
             elif days_until <= lead_days_for(hours):
                 upcoming_items.append((course["name"], a["name"], due_local, url, hours, days_until))
 
+            if 2 <= days_until <= NEXT_WEEK_WINDOW_DAYS:
+                next_week_items.append((course["name"], a["name"], due_local, url, hours, days_until))
+
     today_items.sort(key=lambda x: x[2])
     tomorrow_items.sort(key=lambda x: x[2])
+    next_week_items.sort(key=lambda x: (-x[4], x[2]))  # most estimated hours first, then soonest due
     upcoming_items.sort(key=lambda x: x[2])
-    return today_items, tomorrow_items, upcoming_items
+    return today_items, tomorrow_items, next_week_items, upcoming_items
 
 
 def format_section(title, items):
@@ -173,6 +183,18 @@ def format_section(title, items):
     for course_name, assignment_name, due_local, url, hours in items:
         time_str = due_local.strftime("%I:%M %p").lstrip("0")
         lines.append(f"  [{time_str}] {course_name} — {assignment_name} (~{hours}h)")
+        if url:
+            lines.append(f"      {url}")
+    return "\n".join(lines) + "\n"
+
+
+def format_next_week_section(items):
+    if not items:
+        return "DUE NEXT WEEK\n  Nothing due.\n"
+    lines = ["DUE NEXT WEEK (ranked by importance)"]
+    for i, (course_name, assignment_name, due_local, url, hours, days_until) in enumerate(items, start=1):
+        day_str = due_local.strftime("%a %b %d")
+        lines.append(f"  {i}. {course_name} — {assignment_name} (~{hours}h, due {day_str})")
         if url:
             lines.append(f"      {url}")
     return "\n".join(lines) + "\n"
@@ -192,10 +214,11 @@ def format_upcoming_section(items):
     return "\n".join(lines) + "\n"
 
 
-def build_email_body(today_items, tomorrow_items, upcoming_items):
+def build_email_body(today_items, tomorrow_items, next_week_items, upcoming_items):
     parts = [
         format_section("DUE TODAY", today_items),
         format_section("DUE TOMORROW", tomorrow_items),
+        format_next_week_section(next_week_items),
     ]
     upcoming_section = format_upcoming_section(upcoming_items)
     if upcoming_section:
@@ -256,8 +279,8 @@ def main():
     if args.sync_syllabi:
         sync_syllabi(session, config)
 
-    today_items, tomorrow_items, upcoming_items = collect_digest_items(session, config)
-    body = build_email_body(today_items, tomorrow_items, upcoming_items)
+    today_items, tomorrow_items, next_week_items, upcoming_items = collect_digest_items(session, config)
+    body = build_email_body(today_items, tomorrow_items, next_week_items, upcoming_items)
     subject = f"Canvas Digest — {datetime.now(config['tz']).strftime('%A, %B %d')}"
 
     if args.dry_run:
@@ -265,7 +288,13 @@ def main():
         print(body)
         return
 
-    if not today_items and not tomorrow_items and not upcoming_items and not config["send_if_empty"]:
+    if (
+        not today_items
+        and not tomorrow_items
+        and not next_week_items
+        and not upcoming_items
+        and not config["send_if_empty"]
+    ):
         print("Nothing due today or tomorrow; SEND_IF_EMPTY=false, skipping email.")
         return
 
